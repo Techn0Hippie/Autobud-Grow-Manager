@@ -12,6 +12,7 @@
 //Change these depending on the hardware
 const int pump = 14;
 
+//const int resetbtn = 13;
 const int resetbtn = 4;
 
 
@@ -45,6 +46,7 @@ const char* PARAM_LIGHT = "lightInt";
 
 //Paths to API endpoint to post data
 const char* serverName = "/upload";
+const char* daycount = "/daycount";
 const char* imgapi = "/imgupload";
 const char* logapi = "/log";
 const char* alertapi = "/emailalert";
@@ -63,6 +65,7 @@ String watertime = "0";
 
 unsigned long lastTime = 0;
 unsigned long timerDelay = 3600000;
+//unsigned long timerDelay = 10000;
 boolean PUMPON = false;
 bool wifisetup = false;
 int lighttime = 0;
@@ -235,7 +238,7 @@ body > section {
 
 <body>
   <header>
-    <div id="logo"><img src="/logo.png">Autobud&nbsp;WaterMGR</div>
+    <div id="logo"><img src="/logo.png">Autobud&nbsp;GrowManager</div>
     <nav>  
       <ul>
         <li><a href="/">Home</a>
@@ -246,7 +249,7 @@ body > section {
     </nav>
   </header>
   <section>
-    <strong>Beta Version: 0.95</strong>
+    <strong>Beta Version: 0.951</strong>
   </section>
   <section id="pageContent">
     <main role="main">
@@ -611,7 +614,7 @@ if (ssidlength == 0) {
    Serial.println(savedpass);
    //char hname[19];
    //snprintf(hname, 12, "ESP%d-LIGHT", 32);
-   char hname[] = "AutobudWaterMGR";
+   char hname[] = "AutobudGrowMGR";
 
   while (WiFi.waitForConnectResult() != WL_CONNECTED) {
     Serial.print("Attempting to connect to WiFi ");
@@ -941,6 +944,10 @@ if (GrowInfo == waternext) {
 
 //STEP 9 Check water reserve and alert if low
 LowWaterCheck();
+
+// STEP 10 Post day counts 
+DayCounter();
+
  //END NEW DAY ROLLOVER
  }
   
@@ -1212,6 +1219,28 @@ if (precentleft < 0.25){
   bootemail();
 }
 }
+
+void DayCounter ( void )
+ {
+//post to daycount API
+    String apipath = readFile(SPIFFS, "/apiaddress.txt");
+    String apipath1 = apipath + daycount;
+    int flowerday = readFile(SPIFFS, "/FlowerDay.txt").toInt();
+    int vegday = readFile(SPIFFS, "/VegDay.txt").toInt();
+    
+    HTTPClient http;
+    http.begin(apipath1);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    String IDx = readFile(SPIFFS, "/id.txt"); 
+    String postdata = "Id=" + IDx + "&veg=" + vegday + "&flower=" + flowerday;
+    int httpResponseCode = http.POST(postdata);
+    
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+    delay(1000);
+    http.end();
+
+ }
   
 
  
