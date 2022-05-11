@@ -9,12 +9,8 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 
-//Change these depending on the hardware
-const int pump = 14;
-
-//const int resetbtn = 13;
-const int resetbtn = 4;
-
+//This will be selectable in a new release
+int resetbtn = 4;
 
 AsyncWebServer server(80);
 
@@ -43,6 +39,8 @@ const char* PARAM_ABCAMADDESS = "abcamaddress";
 const char* PARAM_APIADDRESS = "apiaddress";
 const char* PARAM_ALERT = "alertadd";
 const char* PARAM_LIGHT = "lightInt";
+const char* PARAM_DEVID = "devid";
+const char* PARAM_PUMPGPIO = "pumpgpio";
 
 //Paths to API endpoint to post data
 const char* serverName = "/upload";
@@ -78,9 +76,7 @@ int FD = 0;
 int VD = 0;
 int tankLvl = 0;
 int autowater = 0;
-//Sets the ID of this unit for logging purposes 
-String ID = "420";
-//Only use this if a OTA update is needed to update an ID
+
 
 //Default values when using external sensor
 float temp = 0.0;
@@ -249,7 +245,7 @@ body > section {
     </nav>
   </header>
   <section>
-    <strong>Beta Version: 0.951</strong>
+    <strong>Beta Version: 0.954</strong>
   </section>
   <section id="pageContent">
     <main role="main">
@@ -306,7 +302,7 @@ body > section {
         </p>
       </article>
       <article>
-        <h2>Connections</h2>
+        <h2>Connections & Configuration</h2>
         <p>   </form><br>
         <form action="/get" target="hidden-form">
          WiFi SSID (%WiFiSSID%): <input type="text" name="WiFiSSID">
@@ -324,13 +320,21 @@ body > section {
          Alert Text/Email: (Current: %alertadd%): <input type="number " name="alertadd">
          <input type="submit" value="Submit" onclick="submitMessage()">
          </form><br></p>
+         <form action="/get" target="hidden-form">
+         Device ID: (Current: %devid%): <input type="text" name="devid">
+         <input type="submit" value="Submit" onclick="submitMessage()">
+         </form><br></p>
+         <form action="/get" target="hidden-form">
+         Pump GPIO: (Current: %pumpgpio%): <input type="text" name="pumpgpio">
+         <input type="submit" value="Submit" onclick="submitMessage()">
+         </form><br></p>
       </article>
     </main>
     <aside>
       <div>Grow Status
       </form><br>
     </form>
-    DeviceID: %ID%
+    DeviceID: %devid%
     </form><br>
     Grow Day: %GrowDay%
     </form><br>
@@ -508,9 +512,12 @@ String processor(const String& var){
     else if(var == "WaterRequest"){
     return String(WaterRequest);
   }
-  else if(var == "ID"){
+  else if(var == "devid"){
     //return String(ID);
     return readFile(SPIFFS, "/id.txt");   
+  }
+  else if(var == "pumpgpio"){
+    return readFile(SPIFFS, "/pumpgpio.txt");   
   }
   else if(var == "WaterNXT"){
     return readFile(SPIFFS, "/waternext.txt");
@@ -561,8 +568,7 @@ if(!SPIFFS.begin()){
     Serial.println("SPIFFS mounted successfully");
   }
 
-//Remove this, just for firstime flash 
-writeFile(SPIFFS, "/id.txt", ID.c_str());
+
 
   // Check reset button (if user pushes then goes into reset mode)
   pinMode(resetbtn, INPUT);
@@ -637,8 +643,8 @@ if (ssidlength == 0) {
   //end wifi
  }
 //Setup all relays
-    pinMode(pump, OUTPUT);
-    digitalWrite(pump, LOW);
+//    pinMode(pump, OUTPUT);
+//    digitalWrite(pump, LOW);
     
 
   //BootLEDCheck();
@@ -817,6 +823,16 @@ AsyncElegantOTA.begin(&server);    // Start ElegantOTA
     else if (request->hasParam(PARAM_WATERCAL)) {
       inputMessage = request->getParam(PARAM_WATERCAL)->value();
       writeFile(SPIFFS, "/watercalc.txt", inputMessage.c_str());
+    }
+
+    else if (request->hasParam(PARAM_DEVID)) {
+      inputMessage = request->getParam(PARAM_DEVID)->value();
+      writeFile(SPIFFS, "/id.txt", inputMessage.c_str());
+    }
+
+    else if (request->hasParam(PARAM_PUMPGPIO)) {
+      inputMessage = request->getParam(PARAM_PUMPGPIO)->value();
+      writeFile(SPIFFS, "/pumpgpio.txt", inputMessage.c_str());
     }
     
     else {
@@ -1091,6 +1107,12 @@ void localWifi ( void ){
 //Here is everything for claucalting and delivering accurate timed watering
 void PUMPON1( void ) 
 {
+
+//Define Pump GPIO 
+int pump = readFile(SPIFFS, "/pumpgpio.txt").toInt();
+pinMode(pump, OUTPUT);
+digitalWrite(pump, LOW);
+
 
 // read the value from the spiffs
 String watertimeN = readFile(SPIFFS, "/watertime.txt");
