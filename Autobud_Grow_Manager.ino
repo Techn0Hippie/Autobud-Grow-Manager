@@ -245,7 +245,7 @@ body > section {
     </nav>
   </header>
   <section>
-    <strong>Beta Version: 0.954</strong>
+    <strong>Beta Version: 0.961</strong>
   </section>
   <section id="pageContent">
     <main role="main">
@@ -254,7 +254,7 @@ body > section {
         <p>
     </form><br>
    <form action="/get" target="_top">
-    Auto Water: (Water Frequency: %inputInt%): <input type="number " name="inputInt">
+    Auto Water: (Water Every %inputInt% Hours): <input type="number " name="inputInt">
     <input type="submit" value="Submit" onclick="submitMessage()">
     </form><br>
     <form action="/get" target="hidden-form">
@@ -344,7 +344,7 @@ body > section {
     </form><br>
     Hour: %GrowHour%
     </form><br>
-    Next Water Day: %WaterNXT%
+    Watering in %WaterNXT% Hours
     </form><br>
     Water Tank Level: %tankLvl% Ounces Remaining
   </div>
@@ -454,15 +454,17 @@ int DAY = sDAY.toInt();
 //Triggers the next update of a water event. Used in water shceduling (ie. Water X amount every Y Days)
 void WaterUpdate( void ) {
   Serial.println("Updating auto water frequency");
-  int waternext = 0;
-  int growdayrd = readFile(SPIFFS, "/growlog.txt").toInt();
-  int waterfreq = readFile(SPIFFS, "/inputInt.txt").toInt();
+  int waternext;
 
-  waternext = (waterfreq + growdayrd);
+//  int growdayrd = readFile(SPIFFS, "/growlog.txt").toInt();
+  int waterfreq = readFile(SPIFFS, "/inputInt.txt").toInt();
+  waternext = waterfreq;
+//
+//  waternext = (waterfreq + growdayrd);
    String waternextSTR = String(waternext);
     writeFile(SPIFFS, "/waternext.txt", waternextSTR.c_str());
-  Serial.println("Water Update Complete. Next water day = ");
-  Serial.println(waternext);
+//  Serial.println("Water Update Complete. Next water day = ");
+//  Serial.println(waternext);
 }
 
 //Stuff for outputting local vars in the web UI
@@ -933,26 +935,20 @@ String ReadFileVegDay = readFile(SPIFFS, "/VegDay.txt");
     delay(1000);
     http.end();
     
-    //Step 5: Checking Watering. Here we do diffrent things depending if auto is online 
+    //Step 5: Checking Watering. Here we do diffrent things depending if auto is online
+    // NEW RELEASE MOVING TO HOURLY FUNCTIONS  
 //    WaterFormula1();
     
-    int waternext = readFile(SPIFFS, "/waternext.txt").toInt();
-    Serial.print("Checking AutoWater");
-    Serial.print("");
-    Serial.print("GrowDay =   ");
-    Serial.print(GrowInfo);
-    Serial.print("");
-    Serial.print("Next Water Day =   ");
-    Serial.print(waternext);
-
-//Step 6 Execute water if it is a water day
-if (GrowInfo == waternext) {
-  //WATER
-  PUMPON1();
-  //INCRAMENT
-  WaterUpdate();
-  
- }
+//    int waternext = readFile(SPIFFS, "/waternext.txt").toInt();
+//
+////Step 6 Execute water if it is a water day
+//if (GrowInfo == waternext) {
+//  //WATER
+//  PUMPON1();
+//  //INCRAMENT
+//  WaterUpdate();
+//  
+// }
 
  
  //Step 8 Set the TriggerWater monitor back to 0 if soil drys out today. ONLY FOR EXTERNAL SENSOR
@@ -1082,10 +1078,9 @@ if (TriggerWater == 1) {
     MoistureWater();
 
 }
-Serial.print("Trigger Status is:");
-Serial.print(TriggerWater);
 
-
+//Check auto water
+AutoWater();
 
 //End Hourly Checks 
 }
@@ -1263,6 +1258,25 @@ void DayCounter ( void )
     http.end();
 
  }
-  
+
+//WORKING HERE
+ void AutoWater ( void )
+ {
+
+int waternext = readFile(SPIFFS, "/waternext.txt").toInt();
+int waterfreq = readFile(SPIFFS, "/inputInt.txt").toInt();
+
+if (waternext == 0) {
+   PUMPON1();
+   WaterUpdate();
+   //waternext = waterfreq;
+}
+else {
+ waternext = (waternext - 1);
+ String waterstring = String(waternext);
+ writeFile(SPIFFS, "/waternext.txt", waterstring.c_str());
+}
+} 
+ 
 
  
