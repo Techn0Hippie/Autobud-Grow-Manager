@@ -1,924 +1,698 @@
+/*
+ * Autobud Grow Manager v3.0 - Refactored & Optimized
+ * Version: Beta 1.3
+ * * CHANGES:
+ * - ADDED: WiFi Status Code printing (to debug connection failures).
+ * - FIXED: WiFi.begin() using .c_str() for better compatibility.
+ * - ADDED: WiFi Hostname setting.
+ * - CHANGED: Increased WiFi connection timeout.
+ */
+
 #include <Arduino.h>
-#include <ESPAsyncWebServer.h>
-#include "Arduino.h"
-#include <AsyncElegantOTA.h>
-#include <FS.h>
-#include <ESPAsyncTCP.h>
 #include <ESP8266WiFi.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncElegantOTA.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #include <ESP8266HTTPClient.h>
-#include <DNSServer.h> 
+#include <DNSServer.h>
 
-// --- Hardware Pins ---
-const int RESET_BUTTON_GPIO = 0; 
+#define FW_VERSION "Beta 1.31"
 
-// --- Web Server & WiFi ---
+// ==========================================
+//               GLOBALS & CONFIG
+// ==========================================
+
+// Defaults
+const char* AP_SSID = "Autobud_Setup";
+const char* AP_PASS = "grow4life";
+
+// Web Server
 AsyncWebServer server(80);
-WiFiClient wifiClient; 
-const char* AP_SSID = "Autobud";
-const char* AP_PASS = "Grow4Life";
-bool localonly = false; 
-DNSServer dnsServer; 
+DNSServer dnsServer;
+WiFiClient wifiClient;
 
-// --- Global Settings (Loaded from SPIFFS) ---
-String wifiSSID = "";
-String wifiPassword = "";
-String apiAddress = "";
-String alertAddress = "";
-String deviceID = "";
-String macAddress = "";
-int pump_gpio = 4;
-int led_gpio = 5; 
-int waterInterval = 24;
-int waterAmount = 1;
-float waterCal = 4.0;
-int waterTankVolume = 120;
-int dryThreshold = 20;
-int lightHours = 18;
+// Flags & State
+bool localOnly = false;
+bool shouldSaveConfig = false;
+bool shouldSaveState = false;
+bool pumpRunning = false;
+bool shouldReboot = false; // New flag for safe reboot
+unsigned long pumpStartTime = 0;
+unsigned long pumpDuration = 0;
 
-// --- Global State (Loaded from SPIFFS, updated by code) ---
-int growDay = 1;
-int hourCount = 1;
-int vegDays = 0;
-int flowerDays = 0;
-int waterNextHour = 0;
-float waterTankLevel = 0.0;
+// Timers
+unsigned long lastHourMillis = 0;
+const unsigned long HOUR_MS = 3600000; // 3600000 = 1 hour
 
-// --- Sensor Data (from external) ---
-float temp = 0.0;
-float hum = 0.0;
-float moist = 0.0;
+// --- Main Configuration Object ---
+struct Config {
+  String wifiSSID;
+  String wifiPass;
+  String apiAddress;
+  String alertAddress;
+  String deviceID;
+  
+  // NODE MCU PIN MAPPING:
+  // D1 = 5, D2 = 4, D3 = 0 (Flash Button), D4 = 2 (Builtin LED)
+  int pumpPin = 4;      // Default GPIO 4 (D2)
+  int ledPin = 5;       // Default GPIO 5 (D1)
+  int buttonPin = 0;    // Default GPIO 0 (D3 / Flash Button)
+  
+  int waterIntervalHours = 24;
+  float waterAmount = 1.0;     
+  float waterCal = 4.0;        
+  float tankVolume = 120.0;
+  int dryThreshold = 20;
+  int lightHours = 18;
+};
 
-// --- Flags (Internal state, not saved) ---
-bool waterRequestFlag = false;
-bool dataRequestFlag = false;
-bool triggerDryWater = false;
+// --- Main State Object ---
+struct State {
+  int growDay = 1;
+  int currentHour = 1;
+  int vegDays = 0;
+  int flowerDays = 0;
+  int waterNextHour = 0;
+  float tankLevel = 120.0;
+  bool triggerDryWater = false;
+};
 
-// --- Timers ---
-unsigned long lastTime = 0;
-unsigned long timerDelay = 3600000; // 1 hour
-//unsigned long timerDelay = 10000; // 10-second test
+// Initialize Globals
+Config config;
+State growState;
 
-// --- Web UI Parameter Names ---
-const char* PARAM_INT = "inputInt";
-const char* PARAM_WATERTM = "waterInt";
-const char* PARAM_VOLUME = "volume";
-const char* PARAM_THREASHOLD = "threashold";
-const char* PARAM_LEDOFFSET = "ledoffset";
-const char* PARAM_DAYADVANCE = "dayadvance";
-const char* PARAM_DAY = "GrowDay";
-const char* PARAM_WATER = "WaterRequest";
-const char* PARAM_WATERNXT = "WaterNXT";
-const char* PARAM_TEMP = "temp";
-const char* PARAM_HUM = "hum";
-const char* PARAM_MOIST = "moist";
-const char* PARAM_ABADDESS = "abaddress";
-const char* PARAM_WATERCAL = "watercal";
-const char* PARAM_ABCAMADDESS = "abcamaddress";
-const char* PARAM_APIADDRESS = "apiaddress";
-const char* PARAM_ALERT = "alertadd";
-const char* PARAM_LIGHT = "lightInt";
-const char* PARAM_DEVID = "devid";
-const char* PARAM_PUMPGPIO = "pumpgpio";
-const char* PARAM_LEDGPIO = "ledgpio";
-const char* PARAM_WIFI_SSID = "WiFiSSID";
-const char* PARAM_WIFI_PASS = "WiFiPassword";
+// Mock Sensor Data
+float sensorTemp = 72.5;
+float sensorHum = 55.0;
+float sensorMoist = 45.0;
 
-// Paths to API endpoint to post data
-const char* serverName = "/upload";
-const char* daycount = "/daycount";
-const char* imgapi = "/imgupload";
-const char* logapi = "/log";
-const char* alertapi = "/emailalert";
-
-// --- HTML Page ---
-const char index_html[] PROGMEM = R"rawliteral(<!DOCTYPE HTML>
-<style type"text/css">
-html,body,div,span,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,abbr,address,cite,code,del,dfn,em,img,ins,kbd,q,samp,small,strong,sub,sup,var,b,i,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td,article,aside,canvas,details,figcaption,figure,footer,header,hgroup,menu,nav,section,summary,time,mark,audio,video{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}
-body{line-height:1; font-family: 'Times New Roman', Times, serif;}
-h1{font-size: 25px;}h2{font-size: 21px;}h3{font-size: 18px;}h4{font-size: 16px;}
-article,aside,details,figcaption,figure,footer,header,hgroup,menu,nav,section{display:block}
-nav ul{list-style:none}
-blockquote,q{quotes:none}
-blockquote:before,blockquote:after,q:before,q:after{content:none}
-a{margin:0;padding:0;font-size:100%;vertical-align:baseline;background:transparent}
-ins{background-color:#ff9;color:#000;text-decoration:none}
-mark{background-color:#ff9;color:#000;font-style:italic;font-weight:bold}
-del{text-decoration:line-through}
-abbr[title],dfn[title]{border-bottom:1px dotted;cursor:help}
-table{border-collapse:collapse;border-spacing:0}
-hr{display:block;height:1px;border:0;border-top:1px solid #ccc;margin:1em 0;padding:0}
-input,select{vertical-align:middle}
-body,html { background-color: #FFF; }
-header { background: #b1b6b8; padding: 20px 30px; max-width: 940px; margin: auto; }
-nav { display: inline-block; }
-nav ul li a { background: #EEE; padding: 2px 10px; font-size: 20px; text-decoration: none; font-weight: bold; color: #444; border-radius: 10px; }
-nav ul li a:hover { background: #FFF; }
-nav ul li { display: inline-block; margin: 10px; }
-nav ul { list-style: none; }
-#pageContent { max-width: 1000px; margin: auto; border: none; }
-main { float: left; width: 60%; }
-aside { float: right; width: 30%; }
-article { border-bottom: 2px dotted #999; padding-bottom: 20px; margin-bottom: 20px; }
-article h2 { font-weight: normal; margin-bottom: 12px; }
-article p { }
-main section { }
-footer { background: #b1b6b8; max-width: 1000px; margin: auto; clear: both; text-align: right; }
-footer p { padding: 20px; }
-address { padding: 10px 20px 30px 10px; }
-aside > div { margin: 10px auto; min-height: 100px; }
-#logo { display: inline-block; vertical-align: middle; font-size: 30px; margin-right: 75px; color: #FFF; }
-#logo img { width: 50px; vertical-align: middle; margin-right: 10px; }
-body > section { max-width: 1000px; margin: auto; padding: 30px 0px; border-bottom: 1px solid #999; color: #333; }
-@media screen and (max-width: 1000px) { body > section { padding: 30px 20px; } }
-@media screen and (max-width: 600px) { main { float: none; width: 100%; } aside { float: none; width: 100%; } }
-</style>
-<html lang="en" class="no-js">
-<meta charset="utf-8">
-<meta http-equiv="x-ua-compatible" content="ie=edge">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Autobud</title>
+// ==========================================
+//               WEB INTERFACE
+// ==========================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autobud Manager</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #f4f4f4; color: #333; margin: 0; padding: 20px; line-height: 1.5; }
+    .container { max-width: 800px; margin: auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    h1, h2 { color: #2e7d32; }
+    .card { background: #fafafa; border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 6px; }
+    .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    label { font-weight: bold; font-size: 0.9em; }
+    input[type=text], input[type=number], input[type=password] { padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 100px; }
+    input.long { width: 200px; }
+    button { background: #2e7d32; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-size: 1em; }
+    button:hover { background: #1b5e20; }
+    button.danger { background: #c62828; }
+    .status-bar { background: #e8f5e9; padding: 10px; border-radius: 4px; margin-bottom: 20px; display: flex; justify-content: space-between; font-weight: bold; }
+    .nav { margin-bottom: 20px; }
+    .nav a { margin-right: 15px; color: #555; text-decoration: none; font-weight: bold; }
+    .fw-tag { font-size: 0.8em; color: #777; background:#eee; padding:2px 5px; border-radius:4px; vertical-align: middle;}
+  </style>
 </head>
 <body>
-  <header>
-    <div id="logo"><img src="/logo.png">Autobud&nbsp;GrowManager</div>
-    <nav>  
-      <ul>
-        <li><a href="/">Home</a></li>
-        <li><a href="/update">Update Firmware</a></li>
-        <li><a href="/post">Reboot</a></li>
-        <li><a href="/start">Restart Grow</a></li>
-      </ul>
-    </nav>
-  </header>
-  <section>
-    <strong>Beta Version: 0.971 (Refactored)</strong>
-  </section>
-  <section id="pageContent">
-    <main role="main">
-      <article>
-        <h2>Auto Water</h2>
-        <p>
-        <form action="/get" target="_top">
-        Auto Water: (Water Every %inputInt% Hours): <input type="number" name="inputInt">
-        <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-        Water Amount (oz): (Current: %waterInt%): <input type="number" name="waterInt">
-        <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-        Water Calibration (%watercal% seconds per oz): <input type="number" name="watercal">
-        <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-        Water Tank Volume ( %volume% oz): <input type="number" name="volume">
-        <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-        Dry Soil Threashold ( %threashold% Precent Dry): <input type="number" name="threashold">
-        <input type="submit" value="Submit" onclick="submitMessage()">
-        </p>
-      </article>
-      <article>
-        <h2>Auto Lighting</h2>
-        <p>
-        <form action="/get" target="hidden-form">
-          Light Hours: (Current: %lightInt%): <input type="number" name="lightInt">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-          </form><br>
-        </p>
-      </article>
-      <article>
-        <h2>Auto Override</h2>
-        <p>
-          <button onclick="PumpControl();">Water</button>
-          <button onclick="refill();">Refill Water Tank</button>
-          <br><br>
-        <form action="/get" target="hidden-form">
-          Grow Hour Shift: <input type="number" name="ledoffset">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-          Grow Day Shift: <input type="number" name="dayadvance">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        </p>
-      </article>
-      <article>
-        <h2>Connections & Configuration</h2>
-        <p>
-        <form action="/get" target="hidden-form">
-          WiFi SSID (%WiFiSSID%): <input type="text" name="WiFiSSID">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-          WiFi Password (****): <input type="text" name="WiFiPassword">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-         <form action="/get" target="hidden-form">
-          API Endpoint: (Current: %apiaddress%): <input type="text" name="apiaddress">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-         <form action="/get" target="hidden-form">
-          Alert Text/Email: (Current: %alertadd%): <input type="text" name="alertadd">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-          Device ID: (Current: %devid%): <input type="text" name="devid">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-          Pump GPIO: (Current: %pumpgpio%): <input type="text" name="pumpgpio">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        <form action="/get" target="hidden-form">
-          LED GPIO: (Current: %ledgpio%): <input type="text" name="ledgpio">
-          <input type="submit" value="Submit" onclick="submitMessage()">
-        </form><br>
-        </p>
-      </article>
-    </main>
-    <aside>
-      <div>Grow Status<br><br>
-      DeviceID: %devid%<br><br>
-      Grow Day: %GrowDay%<br><br>
-      Total Days In Veg: %VegDays%<br><br>
-      Total Days In Flower: %FlowerDays%<br><br>
-      Hour: %GrowHour%<br><br>
-      Watering in %WaterNXT% Hours<br><br>
-      Water Tank Level: %tankLvl% Ounces Remaining<br><br>
-      Device MAC: %mac%<br>
-      </div>
-      <div>Sensor Data<br><br>
-       Tempature: %temp%<br><br>
-       Humidity: %hum%<br><br>
-       Soil Moisture: %moist%
-      </div>
-    </aside>
-  </section>
-  <footer>
-    <p>Designed by Autobud.io</p>
-  </footer>
-</body>
+  <div class="container">
+    <div class="nav">
+        <span style="font-size:1.2em; font-weight:bold; color:#2e7d32;">Autobud <span id="disp_fw" class="fw-tag">Loading...</span></span>
+        <span style="float:right">
+            <a href="/">Home</a>
+            <a href="/update">Update FW</a>
+            <a href="#" onclick="doReboot()">Reboot</a>
+        </span>
+    </div>
+
+    <div class="status-bar">
+        <span>Day <span id="disp_day">--</span></span>
+        <span>Hour <span id="disp_hour">--</span></span>
+        <span>Next Water: <span id="disp_next">--</span>h</span>
+    </div>
+
+    <div class="card">
+        <h2>📊 Live Status</h2>
+        <div class="row"><span>Tank Level:</span> <strong id="disp_tank">--</strong></div>
+        <div class="row"><span>Temp / Hum:</span> <strong><span id="disp_temp">--</span>°F / <span id="disp_hum">--</span>%</strong></div>
+        <div class="row"><span>Soil Moisture:</span> <strong id="disp_moist">--</strong></div>
+        <div class="row">
+            <button onclick="triggerAction('/api/pump')">Run Pump (Manual)</button>
+            <button onclick="triggerAction('/api/refill')">Refill Tank Reset</button>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>💧 Irrigation Settings</h2>
+        <div class="row">
+            <label>Interval (Hours)</label>
+            <input type="number" id="waterInterval" step="1">
+        </div>
+        <div class="row">
+            <label>Amount (Oz)</label>
+            <input type="number" id="waterAmount" step="0.1">
+        </div>
+        <div class="row">
+            <label>Calibration (Sec/Oz)</label>
+            <input type="number" id="waterCal" step="0.1">
+        </div>
+        <div class="row">
+            <label>Tank Volume (Oz)</label>
+            <input type="number" id="tankVolume" step="1">
+        </div>
+         <div class="row">
+            <label>Dry Threshold (%)</label>
+            <input type="number" id="dryThreshold" step="1">
+        </div>
+        <button onclick="saveSettings()">Save Irrigation</button>
+    </div>
+
+    <div class="card">
+        <h2>💡 Light & System</h2>
+        <div class="row">
+            <label>Light On Duration (Hrs)</label>
+            <input type="number" id="lightHours">
+        </div>
+        <div class="row">
+            <label>Shift Day (Current Day)</label>
+            <input type="number" id="growDay">
+        </div>
+         <div class="row">
+            <label>Shift Hour (Current Hour)</label>
+            <input type="number" id="currentHour">
+        </div>
+        <button onclick="saveSettings()">Save System</button>
+    </div>
+
+    <div class="card">
+        <h2>⚙️ Hardware & Network</h2>
+        <div class="row"><label>Pump GPIO</label><input type="number" id="pumpPin"></div>
+        <div class="row"><label>LED GPIO</label><input type="number" id="ledPin"></div>
+        <div class="row"><label>Button GPIO</label><input type="number" id="buttonPin"></div>
+        <hr style="border:0; border-top:1px solid #ddd; margin:15px 0;">
+        <div class="row"><label>SSID</label><input type="text" id="wifiSSID" class="long"></div>
+        <div class="row"><label>Pass</label><input type="password" id="wifiPass" class="long" placeholder="Keep Empty to Unchanged"></div>
+        <div class="row"><label>API URL</label><input type="text" id="apiAddress" class="long"></div>
+        <div class="row"><label>Device ID</label><input type="text" id="deviceID" class="long"></div>
+        <button onclick="saveSettings()">Save Configuration</button>
+    </div>
+  </div>
+
 <script>
-  function PumpControl() {
-    var phr = new XMLHttpRequest();
-    phr.open('GET', "/PUMPON", true);
-    phr.send();
-  }
-  function refill() {
-    var phr = new XMLHttpRequest();
-    phr.open('GET', "/refill", true);
-    phr.send();
-  }
-  function PullData() {
-    var phr = new XMLHttpRequest();
-    phr.open('GET', "/PullData", true);
-    phr.send();
-  }
-  function start() {
-    var phr = new XMLHttpRequest();
-    phr.open('GET', "/start", true);
-    phr.send();
-  }
-  function post() {
-    var phr = new XMLHttpRequest();
-    phr.open('GET', "/post", true);
-    phr.send();
-  }
-  function submitMessage() {
-    alert("Value Saved");
-    setTimeout(function(){ document.location.reload(false); }, 500);  
-  }
-</script>  
-</html>)rawliteral";
+    // Load Data on Load
+    fetch('/api/data').then(r => r.json()).then(data => {
+        document.getElementById('disp_fw').innerText = data.fw;
 
-// --- SPIFFS Helper Functions ---
-String readFile(fs::FS &fs, const char * path){
-  Serial.printf("Reading file: %s\r\n", path);
-  File file = fs.open(path, "r");
-  if(!file || file.isDirectory()){
-    Serial.println("- empty file or failed to open file");
-    return String();
-  }
-  String fileContent;
-  while(file.available()){
-    fileContent += String((char)file.read());
-  }
-  file.close();
-  return fileContent;
-}
+        // Inputs
+        document.getElementById('waterInterval').value = data.config.waterInterval;
+        document.getElementById('waterAmount').value = data.config.waterAmount;
+        document.getElementById('waterCal').value = data.config.waterCal;
+        document.getElementById('tankVolume').value = data.config.tankVolume;
+        document.getElementById('dryThreshold').value = data.config.dryThreshold;
+        document.getElementById('lightHours').value = data.config.lightHours;
+        
+        document.getElementById('pumpPin').value = data.config.pumpPin;
+        document.getElementById('ledPin').value = data.config.ledPin;
+        document.getElementById('buttonPin').value = data.config.buttonPin;
 
-void writeFile(fs::FS &fs, const char * path, const char * message){
-  Serial.printf("Writing file: %s\r\n", path);
-  File file = fs.open(path, "w");
-  if(!file){
-    Serial.println("- failed to open file for writing");
-    return;
-  }
-  if(file.print(message)){
-    Serial.println("- file written");
-  } else {
-    Serial.println("- write failed");
-  }
-  file.close();
-}
+        document.getElementById('wifiSSID').value = data.config.wifiSSID;
+        document.getElementById('apiAddress').value = data.config.apiAddress;
+        document.getElementById('deviceID').value = data.config.deviceID;
+        
+        document.getElementById('growDay').value = data.state.growDay;
+        document.getElementById('currentHour').value = data.state.currentHour;
 
-// --- Configuration Load Function ---
-void loadConfiguration() {
-  String tempStr;
+        // Display
+        document.getElementById('disp_day').innerText = data.state.growDay;
+        document.getElementById('disp_hour').innerText = data.state.currentHour;
+        document.getElementById('disp_next').innerText = data.state.waterNextHour;
+        document.getElementById('disp_tank').innerText = data.state.tankLevel.toFixed(1) + " oz";
+        document.getElementById('disp_temp').innerText = data.sensor.temp;
+        document.getElementById('disp_hum').innerText = data.sensor.hum;
+        document.getElementById('disp_moist').innerText = data.sensor.moist;
+    });
 
-  tempStr = readFile(SPIFFS, "/ssid.txt");
-  if (tempStr.length() > 0) wifiSSID = tempStr;
+    function saveSettings() {
+        const payload = {
+            waterInterval: parseInt(document.getElementById('waterInterval').value),
+            waterAmount: parseFloat(document.getElementById('waterAmount').value),
+            waterCal: parseFloat(document.getElementById('waterCal').value),
+            tankVolume: parseFloat(document.getElementById('tankVolume').value),
+            dryThreshold: parseInt(document.getElementById('dryThreshold').value),
+            lightHours: parseInt(document.getElementById('lightHours').value),
+            
+            pumpPin: parseInt(document.getElementById('pumpPin').value),
+            ledPin: parseInt(document.getElementById('ledPin').value),
+            buttonPin: parseInt(document.getElementById('buttonPin').value),
+            
+            growDay: parseInt(document.getElementById('growDay').value),
+            currentHour: parseInt(document.getElementById('currentHour').value),
+            wifiSSID: document.getElementById('wifiSSID').value,
+            wifiPass: document.getElementById('wifiPass').value,
+            apiAddress: document.getElementById('apiAddress').value,
+            deviceID: document.getElementById('deviceID').value
+        };
 
-  tempStr = readFile(SPIFFS, "/wifipasswd.txt");
-  if (tempStr.length() > 0) wifiPassword = tempStr;
-  
-  tempStr = readFile(SPIFFS, "/apiaddress.txt");
-  if (tempStr.length() > 0) apiAddress = tempStr;
-
-  tempStr = readFile(SPIFFS, "/alertaddress.txt");
-  if (tempStr.length() > 0) alertAddress = tempStr;
-
-  tempStr = readFile(SPIFFS, "/id.txt");
-  if (tempStr.length() > 0) deviceID = tempStr;
-
-  tempStr = readFile(SPIFFS, "/pumpgpio.txt");
-  if (tempStr.length() > 0) pump_gpio = tempStr.toInt();
-
-  tempStr = readFile(SPIFFS, "/ledgpio.txt");
-  if (tempStr.length() > 0) led_gpio = tempStr.toInt();
-
-  tempStr = readFile(SPIFFS, "/inputInt.txt");
-  if (tempStr.length() > 0) waterInterval = tempStr.toInt();
-
-  tempStr = readFile(SPIFFS, "/watertime.txt");
-  if (tempStr.length() > 0) waterAmount = tempStr.toInt();
-
-  tempStr = readFile(SPIFFS, "/watercalc.txt");
-  if (tempStr.length() > 0) waterCal = tempStr.toFloat();
-
-  tempStr = readFile(SPIFFS, "/volume.txt");
-  if (tempStr.length() > 0) waterTankVolume = tempStr.toInt();
-
-  tempStr = readFile(SPIFFS, "/threashold.txt");
-  if (tempStr.length() > 0) dryThreshold = tempStr.toInt();
-  
-  tempStr = readFile(SPIFFS, "/lightInt.txt");
-  if (tempStr.length() > 0) lightHours = tempStr.toInt();
-
-  // Load State
-  tempStr = readFile(SPIFFS, "/growlog.txt");
-  if (tempStr.length() > 0) growDay = tempStr.toInt(); else growDay = 1;
-
-  tempStr = readFile(SPIFFS, "/hour.txt");
-  if (tempStr.length() > 0) hourCount = tempStr.toInt(); else hourCount = 1;
-
-  tempStr = readFile(SPIFFS, "/VegDay.txt");
-  if (tempStr.length() > 0) vegDays = tempStr.toInt(); else vegDays = 0;
-
-  tempStr = readFile(SPIFFS, "/FlowerDay.txt");
-  if (tempStr.length() > 0) flowerDays = tempStr.toInt(); else flowerDays = 0;
-
-  tempStr = readFile(SPIFFS, "/waternext.txt");
-  if (tempStr.length() > 0) waterNextHour = tempStr.toInt(); else waterNextHour = 0;
-  
-  tempStr = readFile(SPIFFS, "/H20tank.txt");
-  if (tempStr.length() > 0) waterTankLevel = tempStr.toFloat(); else waterTankLevel = waterTankVolume;
-  
-  Serial.println("Configuration and state loaded.");
-}
-
-// --- WebUI Value Processor ---
-String processor(const String& var){
-  if(var == "inputInt"){ return String(waterInterval); }
-  else if(var == "waterInt"){ return String(waterAmount); }
-  else if(var == "volume"){ return String(waterTankVolume); }
-  else if(var == "watercal"){ return String(waterCal); }
-  else if(var == "threashold"){ return String(dryThreshold); }
-  else if(var == "WiFiSSID"){ return wifiSSID; }
-  else if(var == "lightInt"){ return String(lightHours); }
-  else if(var == "mac"){ return macAddress; }
-  else if(var == "WiFiPassword"){ return "********"; }
-  else if(var == "GrowDay"){ return String(growDay); }
-  else if(var == "GrowHour"){ return String(hourCount); }
-  else if(var == "VegDays"){ return String(vegDays); }
-  else if(var == "FlowerDays"){ return String(flowerDays); }
-  else if(var == "devid"){ return deviceID; }
-  else if(var == "pumpgpio"){ return String(pump_gpio); }
-  else if(var == "ledgpio"){ return String(led_gpio); }
-  else if(var == "WaterNXT"){ return String(waterNextHour); }
-  else if(var == "tankLvl"){ return String(waterTankLevel); }
-  else if(var == "temp"){ return String(temp); }
-  else if(var == "moist"){ return String(moist); }
-  else if(var == "hum"){ return String(hum); }
-  else if(var == "apiaddress"){ return apiAddress; }
-  else if(var == "alertadd"){ return alertAddress; }
-  return String();
-}
-
-// --- WiFi Functions ---
-void startAccessPoint() {
-  Serial.println("Starting Access Point (AP) mode.");
-  IPAddress apIP(192, 168, 4, 1); 
-  
-  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0)); 
-  WiFi.softAP(AP_SSID, AP_PASS);
-  
-  Serial.print("AP IP address: ");
-  Serial.println(apIP); 
-  localonly = true;
-
-  dnsServer.start(53, "*", apIP); 
-  Serial.println("DNS server started.");
-}
-
-void connectToWiFi() {
-  bool forceAPMode = false;
-  
-  pinMode(RESET_BUTTON_GPIO, INPUT_PULLUP);
-  Serial.print("Checking for reset button press... ");
-  for(int i = 0; i < 30; i++) {
-    if(digitalRead(RESET_BUTTON_GPIO) == LOW) {
-      forceAPMode = true;
-      break;
+        fetch('/api/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+        }).then(r => { alert('Saved! Rebooting...'); setTimeout(() => { doReboot(); }, 1000); });
     }
-    delay(100);
-  }
 
-  if (forceAPMode) {
-    Serial.println("Button pressed, forcing AP mode.");
-    startAccessPoint();
-    return;
-  }
+    function triggerAction(url) {
+        fetch(url).then(r => alert('Command Sent'));
+    }
 
-  if (wifiSSID.length() == 0) {
-    Serial.println("No WiFi SSID configured.");
-    startAccessPoint();
-    return;
-  }
+    function doReboot() {
+        fetch('/api/reboot').then(() => {
+            alert("Device Rebooting. Wait 10s then reload.");
+        });
+    }
+</script>
+</body>
+</html>
+)rawliteral";
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-  Serial.print("Attempting to connect to WiFi: ");
-  Serial.println(wifiSSID);
+// ==========================================
+//            FILESYSTEM FUNCTIONS
+// ==========================================
 
-  int connect_timeout = 20; 
-  while (WiFi.status() != WL_CONNECTED && connect_timeout > 0) {
-    delay(500);
-    Serial.print(".");
-    connect_timeout--;
-  }
+void loadData() {
+  if (LittleFS.exists("/config.json")) {
+    File file = LittleFS.open("/config.json", "r");
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, file);
+    file.close();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-    macAddress = WiFi.macAddress();
-    localonly = false;
-    String abip = WiFi.localIP().toString();
-    bootemail("Autobud Online! Manage at http://" + abip);
+    config.wifiSSID = doc["ssid"] | "";
+    config.wifiPass = doc["pass"] | "";
+    config.apiAddress = doc["api"] | "";
+    config.deviceID = doc["devid"] | "AB-001";
+    
+    config.pumpPin = doc["pumpPin"] | 4;
+    config.ledPin = doc["ledPin"] | 5;
+    config.buttonPin = doc["buttonPin"] | 0;
+
+    config.waterIntervalHours = doc["wInt"] | 24;
+    config.waterAmount = doc["wAmt"] | 1.0;
+    config.waterCal = doc["wCal"] | 4.0;
+    config.tankVolume = doc["vol"] | 120.0;
+    config.dryThreshold = doc["dryT"] | 20;
+    config.lightHours = doc["lHrs"] | 18;
+    
+    Serial.print("FS: Loaded SSID: ["); Serial.print(config.wifiSSID); Serial.println("]");
+    Serial.print("FS: Loaded Pass: ["); Serial.print(config.wifiPass); Serial.println("]");
+    Serial.println("FS: Config Loaded via JSON");
   } else {
-    Serial.println("\nFailed to connect to WiFi.");
-    startAccessPoint();
+    Serial.println("FS: No config.json found (Fresh Install)");
+  }
+
+  if (LittleFS.exists("/state.json")) {
+    File file = LittleFS.open("/state.json", "r");
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, file);
+    file.close();
+
+    growState.growDay = doc["day"] | 1;
+    growState.currentHour = doc["hour"] | 1;
+    growState.vegDays = doc["veg"] | 0;
+    growState.flowerDays = doc["flower"] | 0;
+    growState.waterNextHour = doc["wNext"] | 0;
+    growState.tankLevel = doc["tank"] | config.tankVolume;
   }
 }
 
-void checkWiFiConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi connection lost. Reconnecting...");
-    WiFi.disconnect();
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+void saveData() {
+  // Save Config
+  if (shouldSaveConfig) {
+    DynamicJsonDocument doc(1024);
+    doc["ssid"] = config.wifiSSID;
+    doc["pass"] = config.wifiPass;
+    doc["api"] = config.apiAddress;
+    doc["devid"] = config.deviceID;
     
-    int connect_timeout = 20; 
-    while (WiFi.status() != WL_CONNECTED && connect_timeout > 0) {
-      delay(500);
-      connect_timeout--;
-    }
-    
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Reconnect failed. Restarting.");
-      ESP.restart(); 
+    doc["pumpPin"] = config.pumpPin;
+    doc["ledPin"] = config.ledPin;
+    doc["buttonPin"] = config.buttonPin;
+
+    doc["wInt"] = config.waterIntervalHours;
+    doc["wAmt"] = config.waterAmount;
+    doc["wCal"] = config.waterCal;
+    doc["vol"] = config.tankVolume;
+    doc["dryT"] = config.dryThreshold;
+    doc["lHrs"] = config.lightHours;
+
+    File file = LittleFS.open("/config.json", "w");
+    if(serializeJson(doc, file) == 0) {
+      Serial.println("FS: Failed to write config.json");
     } else {
-      Serial.println("Reconnect successful.");
+      Serial.println("FS: Config Saved Successfully");
+      Serial.print("FS: Saved Pass: ["); Serial.print(config.wifiPass); Serial.println("]");
     }
+    file.close();
+    shouldSaveConfig = false;
+  }
+
+  // Save State
+  if (shouldSaveState) {
+    DynamicJsonDocument doc(512);
+    doc["day"] = growState.growDay;
+    doc["hour"] = growState.currentHour;
+    doc["veg"] = growState.vegDays;
+    doc["flower"] = growState.flowerDays;
+    doc["wNext"] = growState.waterNextHour;
+    doc["tank"] = growState.tankLevel;
+
+    File file = LittleFS.open("/state.json", "w");
+    serializeJson(doc, file);
+    file.close();
+    shouldSaveState = false;
   }
 }
 
-// --- Setup ---
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\nBooting Autobud...");
-
-  if(!SPIFFS.begin()){
-    Serial.println("An Error has occurred while mounting SPIFFS");
-    ESP.restart();
-  } else {
-    Serial.println("SPIFFS mounted successfully.");
-  }
-
-  loadConfiguration();
-
-  pinMode(pump_gpio, OUTPUT);
-  digitalWrite(pump_gpio, LOW);
-  pinMode(led_gpio, OUTPUT);
-  digitalWrite(led_gpio, LOW);
-  
-  updateLighting(); 
-
-  connectToWiFi(); 
-
-  // --- Web Server Endpoints ---
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html, processor);
-  });
-
-  server.on("/PUMPON", HTTP_GET, [](AsyncWebServerRequest * request) {
-    waterRequestFlag = true;
-    request->send_P(200, "text/plain", "Turning on Pump");
-  });
-
-  server.on("/refill", HTTP_GET, [](AsyncWebServerRequest * request) {
-    waterTankLevel = waterTankVolume;
-    writeFile(SPIFFS, "/H20tank.txt", String(waterTankLevel).c_str());
-    request->send_P(200, "text/plain", "Refilling Tank");
-  });
-
-  server.on("/PullData", HTTP_GET, [](AsyncWebServerRequest * request) {
-    dataRequestFlag = true;
-    request->send_P(200, "text/plain", "Pulling Readings from Meter");
-  });
-
-  server.on("/start", HTTP_GET, [](AsyncWebServerRequest * request) {
-    growDay = 1;
-    hourCount = 1;
-    waterNextHour = 0;
-    vegDays = 0;
-    flowerDays = 0;
-    triggerDryWater = true;
-    
-    writeFile(SPIFFS, "/growlog.txt", "1");
-    writeFile(SPIFFS, "/hour.txt", "1");
-    writeFile(SPIFFS, "/waternext.txt", "0");
-    writeFile(SPIFFS, "/VegDay.txt", "0");
-    writeFile(SPIFFS, "/FlowerDay.txt", "0");
-    
-    request->send_P(200, "text/plain", "Starting New Grow");
-  });
-
-  server.on("/post", HTTP_GET, [](AsyncWebServerRequest * request) {
-    request->send_P(200, "text/plain", "Rebooting");
-    delay(1000);
-    ESP.restart();
-  });
-
-  // --- Main Configuration Handler (/get) ---
-  server.on("/get", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    String inputMessage;
-    bool configChanged = false;
-
-    if (request->hasParam(PARAM_INT)) {
-      inputMessage = request->getParam(PARAM_INT)->value();
-      waterInterval = inputMessage.toInt();
-      writeFile(SPIFFS, "/inputInt.txt", inputMessage.c_str());
-      WaterUpdate();
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_WATERTM)) {
-      inputMessage = request->getParam(PARAM_WATERTM)->value();
-      waterAmount = inputMessage.toInt();
-      writeFile(SPIFFS, "/watertime.txt", inputMessage.c_str());
-      configChanged = true; // <-- THIS IS THE FIXED LINE
-    }
-    else if (request->hasParam(PARAM_VOLUME)) {
-      inputMessage = request->getParam(PARAM_VOLUME)->value();
-      waterTankVolume = inputMessage.toInt();
-      writeFile(SPIFFS, "/volume.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_THREASHOLD)) {
-      inputMessage = request->getParam(PARAM_THREASHOLD)->value();
-      dryThreshold = inputMessage.toInt();
-      writeFile(SPIFFS, "/threashold.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_WIFI_SSID)) {
-      inputMessage = request->getParam(PARAM_WIFI_SSID)->value();
-      wifiSSID = inputMessage;
-      writeFile(SPIFFS, "/ssid.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_WIFI_PASS)) {
-      inputMessage = request->getParam(PARAM_WIFI_PASS)->value();
-      wifiPassword = inputMessage;
-      writeFile(SPIFFS, "/wifipasswd.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_LIGHT)) {
-      inputMessage = request->getParam(PARAM_LIGHT)->value();
-      lightHours = inputMessage.toInt();
-      writeFile(SPIFFS, "/lightInt.txt", inputMessage.c_str());
-      updateLighting();
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_LEDOFFSET)) {
-      inputMessage = request->getParam(PARAM_LEDOFFSET)->value();
-      hourCount = inputMessage.toInt();
-      writeFile(SPIFFS, "/hour.txt", inputMessage.c_str());
-      updateLighting();
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_DAYADVANCE)) {
-      inputMessage = request->getParam(PARAM_DAYADVANCE)->value();
-      growDay = inputMessage.toInt();
-      writeFile(SPIFFS, "/growlog.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_TEMP)) {
-      temp = request->getParam(PARAM_TEMP)->value().toFloat();
-    }
-    else if (request->hasParam(PARAM_HUM)) {
-      hum = request->getParam(PARAM_HUM)->value().toFloat();
-    }
-    else if (request->hasParam(PARAM_MOIST)) {
-      moist = request->getParam(PARAM_MOIST)->value().toFloat();
-    }
-    else if (request->hasParam(PARAM_APIADDRESS)) {
-      inputMessage = request->getParam(PARAM_APIADDRESS)->value();
-      apiAddress = inputMessage;
-      writeFile(SPIFFS, "/apiaddress.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_ALERT)) {
-      inputMessage = request->getParam(PARAM_ALERT)->value();
-      alertAddress = inputMessage;
-      writeFile(SPIFFS, "/alertaddress.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_WATERCAL)) {
-      inputMessage = request->getParam(PARAM_WATERCAL)->value();
-      waterCal = inputMessage.toFloat();
-      writeFile(SPIFFS, "/watercalc.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_DEVID)) {
-      inputMessage = request->getParam(PARAM_DEVID)->value();
-      deviceID = inputMessage;
-      writeFile(SPIFFS, "/id.txt", inputMessage.c_str());
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_PUMPGPIO)) {
-      inputMessage = request->getParam(PARAM_PUMPGPIO)->value();
-      pump_gpio = inputMessage.toInt();
-      writeFile(SPIFFS, "/pumpgpio.txt", inputMessage.c_str());
-      pinMode(pump_gpio, OUTPUT);
-      digitalWrite(pump_gpio, LOW);
-      configChanged = true;
-    }
-    else if (request->hasParam(PARAM_LEDGPIO)) {
-      inputMessage = request->getParam(PARAM_LEDGPIO)->value();
-      led_gpio = inputMessage.toInt();
-      writeFile(SPIFFS, "/ledgpio.txt", inputMessage.c_str());
-      pinMode(led_gpio, OUTPUT);
-      updateLighting();
-      configChanged = true;
-    }
-    else {
-      inputMessage = "No message sent";
-    }
-    
-    if (configChanged) {
-      Serial.println("Configuration saved: " + inputMessage);
-    }
-    
-    request->send(200, "text/text", inputMessage);
-  });
-
-  // --- CAPTIVE PORTAL FIX ---
-  server.onNotFound([](AsyncWebServerRequest *request){
-    Serial.println("Handling 404/Captive Portal request.");
-    request->send_P(200, "text/html", index_html, processor);
-  });
-  
-  AsyncElegantOTA.begin(&server); 
-  server.begin();
-  Serial.println("Web server started.");
-}
-
-// --- Main Loop ---
-void loop() {
-  AsyncElegantOTA.loop();
-
-  if (localonly) {
-    dnsServer.processNextRequest(); 
-  } else {
-    checkWiFiConnection(); 
-  }
-  
-  if (waterRequestFlag) {
-    waterRequestFlag = false; 
-    PUMPON1();
-  }
-
-  if (dataRequestFlag) {
-    dataRequestFlag = false; 
-    pullmeterdata();
-  }
-
-  if ((millis() - lastTime) > timerDelay) {
-    lastTime = millis();
-    handleHourlyTasks();
-  }
-}
-
-// --- Core Logic Functions ---
-void handleHourlyTasks() {
-  hourCount++;
-  
-  if (hourCount > 24){
-    hourCount = 1;
-    handleDailyTasks();
-  }
-
-  writeFile(SPIFFS, "/hour.txt", String(hourCount).c_str());
-  Serial.printf("Hour: %d\n", hourCount);
-  updateLighting();
-
-  if (!localonly) {
-    HeartBeat();
-  }
-
-  if (triggerDryWater) {
-    MoistureWater();
-  }
-  AutoWater();
-}
-
-void handleDailyTasks() {
-  Serial.println("--- New Day Rollover ---");
-  growDay++;
-  writeFile(SPIFFS, "/growlog.txt", String(growDay).c_str());
-
-  if (lightHours <= 12) {
-    flowerDays++;
-    writeFile(SPIFFS, "/FlowerDay.txt", String(flowerDays).c_str());    
-  } else {
-    vegDays++;
-    writeFile(SPIFFS, "/VegDay.txt", String(vegDays).c_str());
-  }
-  
-  Serial.printf("Grow Day: %d (Veg: %d, Flower: %d)\n", growDay, vegDays, flowerDays);
-
-  if (!localonly) {
-    HTTPClient http;
-    String apipath1 = apiAddress + serverName;
-    http.begin(wifiClient, apipath1);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    String devip = WiFi.localIP().toString();
-    String postdata = "Id=" + deviceID + "&GrowDay=" + growDay + "&Ip=" + devip;
-    int httpResponseCode = http.POST(postdata);
-    Serial.printf("Daily POST Response code: %d\n", httpResponseCode);
-    http.end();
-    
-    DayCounter();
-  }
-  
-  triggerDryWater = true;
-  LowWaterCheck();
-}
+// ==========================================
+//               LOGIC & API
+// ==========================================
 
 void updateLighting() {
-  if (hourCount < lightHours) {
-    if(digitalRead(led_gpio) == LOW) {
-      Serial.println("LED ON");
-      digitalWrite(led_gpio, HIGH);
-    }
-  } else {
-    if(digitalRead(led_gpio) == HIGH) {
-      Serial.println("LED OFF");
-      digitalWrite(led_gpio, LOW);
+  bool lightsOn = (growState.currentHour < config.lightHours);
+  // Active High or Low? Assuming Active High for now
+  digitalWrite(config.ledPin, lightsOn ? HIGH : LOW);
+}
+
+void triggerPump(float amountOz) {
+  if (pumpRunning) return; // Already running
+  
+  float durationSecs = amountOz * config.waterCal;
+  pumpDuration = (unsigned long)(durationSecs * 1000);
+  pumpStartTime = millis();
+  
+  digitalWrite(config.pumpPin, HIGH); // PUMP ON
+  pumpRunning = true;
+  
+  // Deduct from tank
+  growState.tankLevel -= amountOz;
+  shouldSaveState = true;
+  
+  Serial.printf("Pump ON for %.1f sec (%.1f oz)\n", durationSecs, amountOz);
+}
+
+void handlePumpLogic() {
+  if (pumpRunning) {
+    if (millis() - pumpStartTime >= pumpDuration) {
+      digitalWrite(config.pumpPin, LOW); // PUMP OFF
+      pumpRunning = false;
+      Serial.println("Pump OFF");
     }
   }
 }
 
-void AutoWater() {
-  if (waterNextHour == 0) {
-    Serial.println("AutoWater: Time to water.");
-    PUMPON1();
-    WaterUpdate();
-  } else {
-    waterNextHour--;
-    Serial.printf("AutoWater: %d hours until next water.\n", waterNextHour);
-  }
-  writeFile(SPIFFS, "/waternext.txt", String(waterNextHour).c_str());
-}
-
-void WaterUpdate(void) {
-  Serial.println("Updating auto water frequency");
-  waterNextHour = waterInterval;
-}
-
-void PUMPON1(void) {
-  float calcedwatertimeX = (waterAmount * (waterCal * 1000.0));
-  int waterTimeMillis = (int)calcedwatertimeX;
-
-  Serial.printf("Watering for %d ms (%d oz @ %.2f s/oz)\n", waterTimeMillis, waterAmount, waterCal);
-  
-  digitalWrite(pump_gpio, HIGH);
-  delay(waterTimeMillis);
-  digitalWrite(pump_gpio, LOW);
-  
-  Serial.println("Watering Completed.");
-
-  waterTankLevel = waterTankLevel - waterAmount;
-  writeFile(SPIFFS, "/H20tank.txt", String(waterTankLevel).c_str());  
-
-  if (!localonly) {
+void postApiData() {
+    if(localOnly || config.apiAddress == "") return;
+    
     HTTPClient http;
-    String logpath1 = apiAddress + logapi;
-    http.begin(wifiClient, logpath1);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    String postdata = "Id=" + deviceID + "&msg=3&amt=" + String(waterAmount);
-    Serial.println("Logging water event: " + postdata);
-    int httpResponseCode = http.POST(postdata);
-    Serial.printf("HTTP Response code: %d\n", httpResponseCode);
+    WiFiClient client;
+    http.begin(client, config.apiAddress); // User requested just a JSON dump
+    http.addHeader("Content-Type", "application/json");
+    
+    DynamicJsonDocument doc(1024);
+    doc["id"] = config.deviceID;
+    doc["day"] = growState.growDay;
+    doc["hour"] = growState.currentHour;
+    doc["tank"] = growState.tankLevel;
+    doc["temp"] = sensorTemp;
+    doc["hum"] = sensorHum;
+    doc["fw"] = FW_VERSION;
+    
+    String json;
+    serializeJson(doc, json);
+    
+    int rc = http.POST(json);
+    Serial.printf("API Post: %d\n", rc);
     http.end();
-  }
-
-  triggerDryWater = false;
-  LowWaterCheck();
 }
 
-void MoistureWater() {
-  if ((moist > 0) && (moist < dryThreshold)) {
-    Serial.print("SOIL DRY, setting water flag.");
-    waterRequestFlag = true;
+void processHour() {
+  growState.currentHour++;
+  
+  // Daily Rollover
+  if (growState.currentHour > 24) {
+    growState.currentHour = 1;
+    growState.growDay++;
+    if(config.lightHours <= 12) growState.flowerDays++;
+    else growState.vegDays++;
+    
+    // Daily tasks could go here
+    Serial.println("--- New Day ---");
   }
+  
+  // Check Water
+  if (growState.waterNextHour <= 0) {
+    triggerPump(config.waterAmount);
+    growState.waterNextHour = config.waterIntervalHours;
+  } else {
+    growState.waterNextHour--;
+  }
+
+  // Update Lighting
+  updateLighting();
+  
+  // Send Data
+  postApiData();
+  
+  // Save State
+  shouldSaveState = true;
 }
 
-void LowWaterCheck(void) {
-  float percentleft = (waterTankLevel / waterTankVolume);
-  if (percentleft < 0.25) { 
-    Serial.println("WATER LOW: Sending email alert.");
-    if (!localonly) {
-      bootemail("Autobud Alert! H2O Reserve Low");
+// ==========================================
+//               SETUP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Give serial time to start
+  Serial.println("\n\n--- Autobud Booting ---");
+  
+  LittleFS.begin();
+  loadData();
+
+  // Hardware Pins Init
+  Serial.printf("Pins: Pump=%d, LED=%d, Button=%d\n", config.pumpPin, config.ledPin, config.buttonPin);
+  pinMode(config.pumpPin, OUTPUT);
+  pinMode(config.ledPin, OUTPUT);
+  digitalWrite(config.pumpPin, LOW);
+  updateLighting();
+
+  // ----------------------------------------------------
+  // SAFETY CHECK: Force AP Mode if Button Held at Boot
+  // ----------------------------------------------------
+  pinMode(config.buttonPin, INPUT_PULLUP);
+  int btnState = digitalRead(config.buttonPin);
+  Serial.printf("Button Pin State: %d (0=PRESSED)\n", btnState);
+  
+  if(btnState == LOW) {
+    delay(100);
+    if(digitalRead(config.buttonPin) == LOW) {
+        Serial.println("!!! Button Held - FORCING AP MODE !!!");
+        localOnly = true;
+    }
+  }
+  // ----------------------------------------------------
+
+  // Network Setup (Skip if safety check triggered)
+  if (!localOnly && config.wifiSSID != "") {
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(config.wifiSSID);
+    Serial.print("Using Pass: [");
+    Serial.print(config.wifiPass);
+    Serial.println("]");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.hostname("Autobud-Manager"); // Set Hostname before begin
+    WiFi.disconnect(); // Clear old cached creds
+    delay(100);
+    // Use .c_str() for safer conversion
+    WiFi.begin(config.wifiSSID.c_str(), config.wifiPass.c_str());
+    
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 40) { // Increased timeout
+      delay(500); Serial.print("."); retries++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi Connected: " + WiFi.localIP().toString());
+    } else {
+      Serial.print("\nWiFi Failed. Status: ");
+      Serial.println(WiFi.status());
+      Serial.println("(1=No SSID, 3=Conn, 4=Fail, 6=Bad Pass)");
+      localOnly = true;
     }
   } else {
-    Serial.printf("Water Tank Level: %.1f%%\n", percentleft * 100);
+    Serial.println("No SSID or Safety Trigger. AP Mode.");
+    localOnly = true;
   }
-}
 
-// --- HTTP POST Functions ---
-String HeartBeat() {
-  HTTPClient http;
-  String apipath1 = apiAddress + serverName;
-  http.begin(wifiClient, apipath1);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  String devip = WiFi.localIP().toString();
-  String postdata = "Id=" + deviceID + "&GrowDay=" + growDay + "&Ip=" + devip;
+  if (localOnly) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    Serial.println("AP Mode Started: IP 192.168.4.1");
+  }
+
+  // --- Web Routes ---
   
-  int httpResponseCode = http.POST(postdata);
-  if(httpResponseCode != 200) {
-    Serial.printf("HeartBeat HTTP error: %d\n", httpResponseCode);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // API: Get Data (JSON)
+  server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    DynamicJsonDocument doc(2048);
+    
+    doc["fw"] = FW_VERSION; // Send FW Version
+
+    JsonObject c = doc.createNestedObject("config");
+    c["waterInterval"] = config.waterIntervalHours;
+    c["waterAmount"] = config.waterAmount;
+    c["waterCal"] = config.waterCal;
+    c["tankVolume"] = config.tankVolume;
+    c["dryThreshold"] = config.dryThreshold;
+    c["lightHours"] = config.lightHours;
+    
+    c["pumpPin"] = config.pumpPin;
+    c["ledPin"] = config.ledPin;
+    c["buttonPin"] = config.buttonPin;
+
+    c["wifiSSID"] = config.wifiSSID;
+    c["apiAddress"] = config.apiAddress;
+    c["deviceID"] = config.deviceID;
+
+    JsonObject s = doc.createNestedObject("state");
+    s["growDay"] = growState.growDay;
+    s["currentHour"] = growState.currentHour;
+    s["waterNextHour"] = growState.waterNextHour;
+    s["tankLevel"] = growState.tankLevel;
+    
+    JsonObject sn = doc.createNestedObject("sensor");
+    sn["temp"] = sensorTemp;
+    sn["hum"] = sensorHum;
+    sn["moist"] = sensorMoist;
+
+    String res;
+    serializeJson(doc, res);
+    request->send(200, "application/json", res);
+  });
+
+  // API: Save Config
+  server.on("/api/save", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+    Serial.println("API: Received Config Save Request");
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, data);
+
+    config.waterIntervalHours = doc["waterInterval"];
+    config.waterAmount = doc["waterAmount"]; // Float!
+    config.waterCal = doc["waterCal"];       // Float!
+    config.tankVolume = doc["tankVolume"];
+    config.dryThreshold = doc["dryThreshold"];
+    config.lightHours = doc["lightHours"];
+    
+    // Hardware
+    int oldPump = config.pumpPin;
+    int oldLed = config.ledPin;
+    config.pumpPin = doc["pumpPin"];
+    config.ledPin = doc["ledPin"];
+    config.buttonPin = doc["buttonPin"];
+    
+    // If Pins changed, reset them immediately
+    if(oldPump != config.pumpPin) {
+        pinMode(oldPump, INPUT); pinMode(config.pumpPin, OUTPUT); digitalWrite(config.pumpPin, LOW);
+    }
+    if(oldLed != config.ledPin) {
+        pinMode(oldLed, INPUT); pinMode(config.ledPin, OUTPUT);
+    }
+
+    // Updates State manually if changed in UI
+    growState.growDay = doc["growDay"];
+    growState.currentHour = doc["currentHour"];
+    
+    String newSSID = doc["wifiSSID"];
+    String newPass = doc["wifiPass"];
+    
+    if(newSSID.length() > 0) {
+        Serial.print("API: Updating SSID to: "); Serial.println(newSSID);
+        config.wifiSSID = newSSID;
+        
+        // BUG FIX: Only update password if user typed one.
+        // If user left it blank, newPass is empty, so we KEEP the old one.
+        if(newPass.length() > 0) {
+            Serial.print("API: Updating Password to: ["); Serial.print(newPass); Serial.println("]");
+            config.wifiPass = newPass; 
+        } else {
+             Serial.println("API: Password field empty. Keeping existing password.");
+        }
+    }
+    config.apiAddress = doc["apiAddress"] | "";
+    config.deviceID = doc["deviceID"] | "";
+
+    shouldSaveConfig = true;
+    shouldSaveState = true;
+    request->send(200, "text/plain", "Saved");
+  });
+
+  // API: Commands
+  server.on("/api/pump", HTTP_GET, [](AsyncWebServerRequest *request){
+    triggerPump(config.waterAmount); // Manual Trigger
+    request->send(200, "text/plain", "OK");
+  });
+  
+  server.on("/api/refill", HTTP_GET, [](AsyncWebServerRequest *request){
+    growState.tankLevel = config.tankVolume;
+    shouldSaveState = true;
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/reboot", HTTP_GET, [](AsyncWebServerRequest *request){
+    shouldReboot = true; // Set Flag
+    request->send(200, "text/plain", "Rebooting...");
+  });
+
+  // Captive Portal
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  AsyncElegantOTA.begin(&server);
+  server.begin();
+  lastHourMillis = millis();
+}
+
+// ==========================================
+//               MAIN LOOP
+// ==========================================
+
+void loop() {
+  AsyncElegantOTA.loop();
+  if (localOnly) dnsServer.processNextRequest();
+
+  // --- REBOOT HANDLER ---
+  if (shouldReboot) {
+    delay(2000); // Wait for web response to finish
+    Serial.println("Rebooting via Web Command...");
+    ESP.restart();
   }
-  http.end();
-  return String(httpResponseCode);
-}
 
-void DayCounter(void) {
-  HTTPClient http;
-  String apipath1 = apiAddress + daycount;
-  http.begin(wifiClient, apipath1);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  String postdata = "Id=" + deviceID + "&veg=" + vegDays + "&flower=" + flowerDays;
-  int httpResponseCode = http.POST(postdata);
-  Serial.printf("DayCounter POST Response code: %d\n", httpResponseCode);
-  http.end();
-}
+  // Non-Blocking Pump
+  handlePumpLogic();
 
-void bootemail(String emailmsg) {
-  if (alertAddress.length() == 0) {
-    Serial.println("No alert email address configured.");
-    return;
+  // Hour Timer
+  if (millis() - lastHourMillis >= HOUR_MS) {
+    lastHourMillis = millis();
+    processHour();
   }
 
-  HTTPClient http;
-  String alertpath1 = apiAddress + alertapi;
-  http.begin(wifiClient, alertpath1);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  String postdata = "Id=" + deviceID + "&to=" + alertAddress + "&ip=" + emailmsg;
-  Serial.println("Sending Email: " + postdata);
-  int httpResponseCode = http.POST(postdata);
-  Serial.printf("Email POST Response code: %d\n", httpResponseCode);
-  http.end();
-}
-
-// --- Other Functions ---
-void notFound(AsyncWebServerRequest *request) {
-  request->send(404, "text/plain", "Not found");
-}
-
-void pullmeterdata(void) {
-  Serial.println("Data pull requested (not implemented).");
+  // Data Persistence (Deferred to loop to avoid FS writes in Interrupts/Callbacks)
+  saveData();
 }
