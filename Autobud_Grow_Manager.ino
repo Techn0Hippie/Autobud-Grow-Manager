@@ -1,11 +1,10 @@
 /*
- * Autobud Grow Manager v3.0 - Refactored & Optimized
- * Version: Beta 1.3
+ * Autobud Grow Manager v3.0
+ * Version: Beta 1.6
  * * CHANGES:
- * - ADDED: WiFi Status Code printing (to debug connection failures).
- * - FIXED: WiFi.begin() using .c_str() for better compatibility.
- * - ADDED: WiFi Hostname setting.
- * - CHANGED: Increased WiFi connection timeout.
+ * - REMOVED: WiFi.disconnect() from setup (caused connection failures on some routers).
+ * - ADDED: WiFi.setAutoReconnect(true).
+ * - CHANGED: Increased WiFi connection timeout to 30 seconds.
  */
 
 #include <Arduino.h>
@@ -18,7 +17,7 @@
 #include <ESP8266HTTPClient.h>
 #include <DNSServer.h>
 
-#define FW_VERSION "Beta 1.31"
+#define FW_VERSION "Beta 1.6"
 
 // ==========================================
 //               GLOBALS & CONFIG
@@ -38,7 +37,7 @@ bool localOnly = false;
 bool shouldSaveConfig = false;
 bool shouldSaveState = false;
 bool pumpRunning = false;
-bool shouldReboot = false; // New flag for safe reboot
+bool shouldReboot = false; 
 unsigned long pumpStartTime = 0;
 unsigned long pumpDuration = 0;
 
@@ -54,11 +53,10 @@ struct Config {
   String alertAddress;
   String deviceID;
   
-  // NODE MCU PIN MAPPING:
-  // D1 = 5, D2 = 4, D3 = 0 (Flash Button), D4 = 2 (Builtin LED)
-  int pumpPin = 4;      // Default GPIO 4 (D2)
-  int ledPin = 5;       // Default GPIO 5 (D1)
-  int buttonPin = 0;    // Default GPIO 0 (D3 / Flash Button)
+  // Generic / Martin Jerry Pinout Defaults
+  int pumpPin = 12;     // Relay
+  int ledPin = 5;       // LED (Blue usually)
+  int buttonPin = 13;   // Main Button
   
   int waterIntervalHours = 24;
   float waterAmount = 1.0;     
@@ -123,7 +121,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <span style="float:right">
             <a href="/">Home</a>
             <a href="/update">Update FW</a>
-            <a href="#" onclick="doReboot()">Reboot</a>
+            <a href="#" onclick="doReboot()">Reboot Device</a>
         </span>
     </div>
 
@@ -166,7 +164,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <label>Dry Threshold (%)</label>
             <input type="number" id="dryThreshold" step="1">
         </div>
-        <button onclick="saveSettings()">Save Irrigation</button>
+        <button onclick="saveSettings()">Save Irrigation Config</button>
     </div>
 
     <div class="card">
@@ -183,7 +181,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <label>Shift Hour (Current Hour)</label>
             <input type="number" id="currentHour">
         </div>
-        <button onclick="saveSettings()">Save System</button>
+        <button onclick="saveSettings()">Save System Config</button>
     </div>
 
     <div class="card">
@@ -196,70 +194,96 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div class="row"><label>Pass</label><input type="password" id="wifiPass" class="long" placeholder="Keep Empty to Unchanged"></div>
         <div class="row"><label>API URL</label><input type="text" id="apiAddress" class="long"></div>
         <div class="row"><label>Device ID</label><input type="text" id="deviceID" class="long"></div>
-        <button onclick="saveSettings()">Save Configuration</button>
+        <button onclick="saveSettings()">Save Hardware & Network</button>
+        <div style="font-size:0.8em; color:#666; margin-top:5px;">Note: Network changes require a manual Reboot to take effect.</div>
     </div>
   </div>
 
 <script>
-    // Load Data on Load
-    fetch('/api/data').then(r => r.json()).then(data => {
-        document.getElementById('disp_fw').innerText = data.fw;
-
-        // Inputs
-        document.getElementById('waterInterval').value = data.config.waterInterval;
-        document.getElementById('waterAmount').value = data.config.waterAmount;
-        document.getElementById('waterCal').value = data.config.waterCal;
-        document.getElementById('tankVolume').value = data.config.tankVolume;
-        document.getElementById('dryThreshold').value = data.config.dryThreshold;
-        document.getElementById('lightHours').value = data.config.lightHours;
-        
-        document.getElementById('pumpPin').value = data.config.pumpPin;
-        document.getElementById('ledPin').value = data.config.ledPin;
-        document.getElementById('buttonPin').value = data.config.buttonPin;
-
-        document.getElementById('wifiSSID').value = data.config.wifiSSID;
-        document.getElementById('apiAddress').value = data.config.apiAddress;
-        document.getElementById('deviceID').value = data.config.deviceID;
-        
-        document.getElementById('growDay').value = data.state.growDay;
-        document.getElementById('currentHour').value = data.state.currentHour;
-
-        // Display
-        document.getElementById('disp_day').innerText = data.state.growDay;
-        document.getElementById('disp_hour').innerText = data.state.currentHour;
-        document.getElementById('disp_next').innerText = data.state.waterNextHour;
-        document.getElementById('disp_tank').innerText = data.state.tankLevel.toFixed(1) + " oz";
-        document.getElementById('disp_temp').innerText = data.sensor.temp;
-        document.getElementById('disp_hum').innerText = data.sensor.hum;
-        document.getElementById('disp_moist').innerText = data.sensor.moist;
+    // Variables to track editing state
+    let isEditing = false;
+    const inputs = document.querySelectorAll('input');
+    inputs.forEach(input => {
+        input.addEventListener('focus', () => isEditing = true);
+        input.addEventListener('blur', () => isEditing = false);
     });
+
+    function fetchStatus() {
+        if(isEditing) return; // Don't overwrite while typing
+
+        fetch('/api/data', { cache: "no-store" })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('disp_fw').innerText = data.fw;
+                
+                // Update Displays
+                document.getElementById('disp_day').innerText = data.state.growDay;
+                document.getElementById('disp_hour').innerText = data.state.currentHour;
+                document.getElementById('disp_next').innerText = data.state.waterNextHour;
+                document.getElementById('disp_tank').innerText = data.state.tankLevel.toFixed(1) + " oz";
+                document.getElementById('disp_temp').innerText = data.sensor.temp;
+                document.getElementById('disp_hum').innerText = data.sensor.hum;
+                document.getElementById('disp_moist').innerText = data.sensor.moist;
+
+                // Update Inputs (Only if not focused, but we check isEditing above)
+                if(document.activeElement.tagName !== "INPUT") {
+                    document.getElementById('waterInterval').value = data.config.waterInterval;
+                    document.getElementById('waterAmount').value = data.config.waterAmount;
+                    document.getElementById('waterCal').value = data.config.waterCal;
+                    document.getElementById('tankVolume').value = data.config.tankVolume;
+                    document.getElementById('dryThreshold').value = data.config.dryThreshold;
+                    document.getElementById('lightHours').value = data.config.lightHours;
+                    
+                    document.getElementById('pumpPin').value = data.config.pumpPin;
+                    document.getElementById('ledPin').value = data.config.ledPin;
+                    document.getElementById('buttonPin').value = data.config.buttonPin;
+
+                    document.getElementById('wifiSSID').value = data.config.wifiSSID;
+                    document.getElementById('apiAddress').value = data.config.apiAddress;
+                    document.getElementById('deviceID').value = data.config.deviceID;
+                    
+                    document.getElementById('growDay').value = data.state.growDay;
+                    document.getElementById('currentHour').value = data.state.currentHour;
+                }
+            })
+            .catch(e => console.log("Data Fetch Error (ignoring if rebooting)", e));
+    }
+
+    // Helper: Get value or Default (Prevents NaN)
+    const getInt = (id) => parseInt(document.getElementById(id).value) || 0;
+    const getFloat = (id) => parseFloat(document.getElementById(id).value) || 0.0;
+    const getStr = (id) => document.getElementById(id).value;
 
     function saveSettings() {
         const payload = {
-            waterInterval: parseInt(document.getElementById('waterInterval').value),
-            waterAmount: parseFloat(document.getElementById('waterAmount').value),
-            waterCal: parseFloat(document.getElementById('waterCal').value),
-            tankVolume: parseFloat(document.getElementById('tankVolume').value),
-            dryThreshold: parseInt(document.getElementById('dryThreshold').value),
-            lightHours: parseInt(document.getElementById('lightHours').value),
+            waterInterval: getInt('waterInterval'),
+            waterAmount: getFloat('waterAmount'),
+            waterCal: getFloat('waterCal'),
+            tankVolume: getFloat('tankVolume'),
+            dryThreshold: getInt('dryThreshold'),
+            lightHours: getInt('lightHours'),
             
-            pumpPin: parseInt(document.getElementById('pumpPin').value),
-            ledPin: parseInt(document.getElementById('ledPin').value),
-            buttonPin: parseInt(document.getElementById('buttonPin').value),
+            pumpPin: getInt('pumpPin'),
+            ledPin: getInt('ledPin'),
+            buttonPin: getInt('buttonPin'),
             
-            growDay: parseInt(document.getElementById('growDay').value),
-            currentHour: parseInt(document.getElementById('currentHour').value),
-            wifiSSID: document.getElementById('wifiSSID').value,
-            wifiPass: document.getElementById('wifiPass').value,
-            apiAddress: document.getElementById('apiAddress').value,
-            deviceID: document.getElementById('deviceID').value
+            growDay: getInt('growDay'),
+            currentHour: getInt('currentHour'),
+            wifiSSID: getStr('wifiSSID'),
+            wifiPass: getStr('wifiPass'),
+            apiAddress: getStr('apiAddress'),
+            deviceID: getStr('deviceID')
         };
 
         fetch('/api/save', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload)
-        }).then(r => { alert('Saved! Rebooting...'); setTimeout(() => { doReboot(); }, 1000); });
+        }).then(r => { 
+            alert('Settings Saved to Memory.'); 
+            // Force a fetch immediately to verify
+            setTimeout(fetchStatus, 500);
+        });
     }
 
     function triggerAction(url) {
@@ -267,10 +291,18 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function doReboot() {
-        fetch('/api/reboot').then(() => {
-            alert("Device Rebooting. Wait 10s then reload.");
-        });
+        if(confirm("Reboot Device now?")) {
+            fetch('/api/reboot').then(() => {
+                alert("Device Rebooting. Please reconnect to WiFi in 20s.");
+            });
+        }
     }
+
+    // Initial Load
+    fetchStatus();
+    // Auto Refresh Loop (Every 3 seconds)
+    setInterval(fetchStatus, 3000);
+
 </script>
 </body>
 </html>
@@ -292,9 +324,9 @@ void loadData() {
     config.apiAddress = doc["api"] | "";
     config.deviceID = doc["devid"] | "AB-001";
     
-    config.pumpPin = doc["pumpPin"] | 4;
+    config.pumpPin = doc["pumpPin"] | 12;
     config.ledPin = doc["ledPin"] | 5;
-    config.buttonPin = doc["buttonPin"] | 0;
+    config.buttonPin = doc["buttonPin"] | 13;
 
     config.waterIntervalHours = doc["wInt"] | 24;
     config.waterAmount = doc["wAmt"] | 1.0;
@@ -304,8 +336,8 @@ void loadData() {
     config.lightHours = doc["lHrs"] | 18;
     
     Serial.print("FS: Loaded SSID: ["); Serial.print(config.wifiSSID); Serial.println("]");
-    Serial.print("FS: Loaded Pass: ["); Serial.print(config.wifiPass); Serial.println("]");
-    Serial.println("FS: Config Loaded via JSON");
+    // Security: Don't print full pass, just length
+    Serial.print("FS: Loaded Pass Length: "); Serial.println(config.wifiPass.length());
   } else {
     Serial.println("FS: No config.json found (Fresh Install)");
   }
@@ -350,9 +382,8 @@ void saveData() {
       Serial.println("FS: Failed to write config.json");
     } else {
       Serial.println("FS: Config Saved Successfully");
-      Serial.print("FS: Saved Pass: ["); Serial.print(config.wifiPass); Serial.println("]");
     }
-    file.close();
+    file.close(); // Forces flush to storage
     shouldSaveConfig = false;
   }
 
@@ -473,7 +504,7 @@ void processHour() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give serial time to start
+  delay(1000); 
   Serial.println("\n\n--- Autobud Booting ---");
   
   LittleFS.begin();
@@ -506,19 +537,16 @@ void setup() {
   if (!localOnly && config.wifiSSID != "") {
     Serial.print("Connecting to WiFi: ");
     Serial.println(config.wifiSSID);
-    Serial.print("Using Pass: [");
-    Serial.print(config.wifiPass);
-    Serial.println("]");
     
     WiFi.mode(WIFI_STA);
-    WiFi.hostname("Autobud-Manager"); // Set Hostname before begin
-    WiFi.disconnect(); // Clear old cached creds
+    WiFi.hostname("Autobud-Manager");
+    // REMOVED: WiFi.disconnect(); // It was causing issues
+    WiFi.setAutoReconnect(true); // Ensure it tries to reconnect
     delay(100);
-    // Use .c_str() for safer conversion
     WiFi.begin(config.wifiSSID.c_str(), config.wifiPass.c_str());
     
     int retries = 0;
-    while (WiFi.status() != WL_CONNECTED && retries < 40) { // Increased timeout
+    while (WiFi.status() != WL_CONNECTED && retries < 60) { // Increased to 30s
       delay(500); Serial.print("."); retries++;
     }
     
@@ -527,7 +555,6 @@ void setup() {
     } else {
       Serial.print("\nWiFi Failed. Status: ");
       Serial.println(WiFi.status());
-      Serial.println("(1=No SSID, 3=Conn, 4=Fail, 6=Bad Pass)");
       localOnly = true;
     }
   } else {
@@ -593,8 +620,8 @@ void setup() {
     deserializeJson(doc, data);
 
     config.waterIntervalHours = doc["waterInterval"];
-    config.waterAmount = doc["waterAmount"]; // Float!
-    config.waterCal = doc["waterCal"];       // Float!
+    config.waterAmount = doc["waterAmount"]; 
+    config.waterCal = doc["waterCal"];      
     config.tankVolume = doc["tankVolume"];
     config.dryThreshold = doc["dryThreshold"];
     config.lightHours = doc["lightHours"];
@@ -614,9 +641,13 @@ void setup() {
         pinMode(oldLed, INPUT); pinMode(config.ledPin, OUTPUT);
     }
 
-    // Updates State manually if changed in UI
-    growState.growDay = doc["growDay"];
-    growState.currentHour = doc["currentHour"];
+    // Input Sanitization for State
+    int newDay = doc["growDay"];
+    int newHour = doc["currentHour"];
+    
+    // Only update if valid (>0) to prevent reset bugs
+    if(newDay > 0) growState.growDay = newDay;
+    if(newHour > 0) growState.currentHour = newHour;
     
     String newSSID = doc["wifiSSID"];
     String newPass = doc["wifiPass"];
@@ -625,13 +656,9 @@ void setup() {
         Serial.print("API: Updating SSID to: "); Serial.println(newSSID);
         config.wifiSSID = newSSID;
         
-        // BUG FIX: Only update password if user typed one.
-        // If user left it blank, newPass is empty, so we KEEP the old one.
         if(newPass.length() > 0) {
-            Serial.print("API: Updating Password to: ["); Serial.print(newPass); Serial.println("]");
+            Serial.println("API: Password Updated");
             config.wifiPass = newPass; 
-        } else {
-             Serial.println("API: Password field empty. Keeping existing password.");
         }
     }
     config.apiAddress = doc["apiAddress"] | "";
@@ -693,6 +720,6 @@ void loop() {
     processHour();
   }
 
-  // Data Persistence (Deferred to loop to avoid FS writes in Interrupts/Callbacks)
+  // Data Persistence
   saveData();
 }
